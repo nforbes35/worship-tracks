@@ -1,0 +1,14 @@
+# Worship Tracks settings. scripts/setup.sh copies this to ~/WorshipTracks/config.env;
+# edit that copy, then restart the server (scripts/autostart.sh restart).
+
+# Team passcode. Leave empty for no passcode (fine if only reachable over Tailscale).
+WT_PASSCODE=
+
+# Port the web app listens on: http://<this-mac>.local:8000
+WT_PORT=8000
+
+# Where songs and tracks are kept.
+WT_DATA_DIR="$HOME/WorshipTracks"
+
+# The instrument sounds. Any General MIDI .sf2 SoundFont works.
+WT_SOUNDFONT="$HOME/WorshipTracks/soundfonts/GeneralUser-GS.sf2"
