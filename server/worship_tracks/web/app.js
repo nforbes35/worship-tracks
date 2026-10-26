@@ -98,6 +98,10 @@ async function libraryView() {
         <span class="muted small" id="picked">Choose an MP3, M4A or WAV file</span>
       </label>
       <input type="text" id="title" placeholder="Song title (optional)" maxlength="120">
+      <label class="row small">
+        <span class="muted">Chord chart (optional)</span>
+        <input type="file" id="chart" accept=".pdf,.txt,.cho,.chopro,.chordpro,.pro,application/pdf,text/plain" class="grow">
+      </label>
       <p class="small error" id="upload-msg" hidden></p>
       <button class="primary" id="upload" disabled>Make play-along tracks</button>
     </section>
@@ -133,6 +137,8 @@ async function libraryView() {
     const form = new FormData();
     form.append("file", file);
     form.append("title", view.querySelector("#title").value);
+    const chartFile = view.querySelector("#chart").files[0];
+    if (chartFile) form.append("chart", chartFile);
     // XHR rather than fetch, for upload progress.
     const xhr = new XMLHttpRequest();
     xhr.open("POST", "/api/songs");
@@ -151,6 +157,7 @@ async function libraryView() {
         return;
       }
       fileInput.value = "";
+      view.querySelector("#chart").value = "";
       view.querySelector("#title").value = "";
       pick(null);
       refresh();
@@ -230,7 +237,7 @@ async function deleteSong(song) {
 
 async function playerView(song) {
   const base = `/api/songs/${song.id}/files`;
-  const version = Math.round(song.created) + (song.processing_seconds || 0);
+  const version = Math.round(song.version || song.created);
   const saved = loadMix(song.id);
   saved.tracks ||= {};
   const tracks = song.tracks.filter((t) => t.present);
@@ -242,6 +249,7 @@ async function playerView(song) {
     <section class="card stack">
       <input type="range" id="seek" min="0" max="${song.duration}" step="0.1" value="0" aria-label="Position">
       <div class="time"><span id="pos">0:00</span><span>${fmt(song.duration)}</span></div>
+      ${song.chords?.length ? `<div class="chords" aria-live="off"><span class="now" id="chord-now">&nbsp;</span><span class="next muted" id="chord-next"></span></div>` : ""}
       <div class="transport">
         <button class="icon" id="back" aria-label="Back 10 seconds">${icons.back}</button>
         <button class="big primary" id="play" aria-label="Play" disabled>${icons.play}</button>
@@ -268,6 +276,9 @@ async function playerView(song) {
       </li>
     </ul>
     ${missing.length ? `<p class="small muted">Not found in this song: ${missing.map((t) => esc(t.label)).join(", ")}.</p>` : ""}
+
+    <h2>Chord chart</h2>
+    <div class="card stack" id="chart-card">${chartCard(song)}</div>
 
     <h2>Master volume</h2>
     <div class="card"><input type="range" id="master" min="0" max="1.5" step="0.01" value="${saved.master ?? 1}" aria-label="Master volume"></div>
@@ -349,9 +360,25 @@ async function playerView(song) {
       const p = player.position();
       seek.value = p;
       pos.textContent = fmt(p);
+      showChord(p);
     }
     raf = requestAnimationFrame(tick);
   };
+  const chordNow = view.querySelector("#chord-now");
+  const chordNext = view.querySelector("#chord-next");
+  const spans = (song.chords || []).filter((c) => c.chord);
+  let shownChord = -1;
+  function showChord(p) {
+    if (!chordNow) return;
+    let i = spans.findIndex((c) => c.start <= p + 0.05 && p + 0.05 < c.end);
+    if (i < 0) i = -2 - spans.findIndex((c) => c.start > p); // between chords: -2 - index of next
+    if (i === shownChord) return;
+    shownChord = i;
+    const current = i >= 0 ? spans[i] : null;
+    const next = spans[i >= 0 ? i + 1 : -2 - i];
+    chordNow.textContent = current ? current.chord : "\u00a0";
+    chordNext.textContent = next ? `then ${next.chord}` : "";
+  }
   let raf = requestAnimationFrame(tick);
 
   const onKey = (e) => {
@@ -456,6 +483,7 @@ async function playerView(song) {
     view.querySelector("h1").textContent = song.title;
   };
   view.querySelector("#delete").onclick = () => deleteSong(song);
+  wireChartCard(song);
 
   cleanup = () => {
     cancelAnimationFrame(raf);
@@ -481,4 +509,67 @@ function trackRow(t, saved) {
         <input class="grow" type="range" min="0" max="1.5" step="0.01" value="${saved.volume ?? 1}" data-action="volume" aria-label="${esc(t.label)} volume">
       </div>
     </li>`;
+}
+
+function chartCard(song) {
+  const chart = song.chart;
+  const summary = chart
+    ? `<p><b>Key of ${esc(chart.key || "?")}</b> · ${chart.unique.map(esc).join("  ")}</p>
+       <p class="small muted">Guitar, keys and pads play these chords, in the rhythm heard in the recording. Bass and melody are kept in key.</p>`
+    : `<p class="small muted">Add the song's chord chart and the guitar, keys, pads and bass will play the right chords instead of guessing every note. A PDF from SongSelect works, or type the chords.</p>`;
+  return `${summary}
+    <div class="row" style="flex-wrap:wrap">
+      <label class="button"><input type="file" id="chart-file" hidden accept=".pdf,.txt,.cho,.chopro,.chordpro,.pro,application/pdf,text/plain">${chart ? "Replace chart" : "Add chord chart"}</label>
+      <button id="chart-type">Type chords</button>
+      ${chart ? '<button class="danger" id="chart-remove">Remove chart</button>' : ""}
+    </div>
+    <form id="chart-form" class="stack" hidden>
+      <textarea id="chart-text" rows="6" placeholder="Key: G&#10;Verse&#10;G  D  Em  C&#10;Chorus&#10;C  G/B  Am7  D"
+        style="width:100%;font:inherit;padding:10px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text)">${chart ? esc(chartText(chart)) : ""}</textarea>
+      <button class="primary" type="submit">Use these chords</button>
+    </form>
+    <p class="small error" id="chart-msg" hidden></p>`;
+}
+
+function chartText(chart) {
+  return `Key: ${chart.key || ""}\n${chart.chords.join("  ")}`;
+}
+
+function wireChartCard(song) {
+  const card = view.querySelector("#chart-card");
+  const msg = card.querySelector("#chart-msg");
+  const send = async (body, method = "POST") => {
+    msg.hidden = true;
+    try {
+      await api(`/songs/${song.id}/chart`, { method, body });
+      route(); // the tracks are being remade; show progress
+    } catch (err) {
+      msg.textContent = err.message;
+      msg.hidden = false;
+    }
+  };
+  card.querySelector("#chart-file").addEventListener("change", (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const form = new FormData();
+    form.append("file", file);
+    send(form);
+  });
+  card.querySelector("#chart-type").onclick = () => {
+    const form = card.querySelector("#chart-form");
+    form.hidden = !form.hidden;
+    if (!form.hidden) form.querySelector("textarea").focus();
+  };
+  card.querySelector("#chart-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const form = new FormData();
+    form.append("text", card.querySelector("#chart-text").value);
+    send(form);
+  });
+  const remove = card.querySelector("#chart-remove");
+  if (remove) {
+    remove.onclick = () => {
+      if (confirm("Remove the chord chart and go back to the AI's own notes?")) send(undefined, "DELETE");
+    };
+  }
 }

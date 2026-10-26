@@ -13,6 +13,8 @@ import traceback
 import uuid
 from pathlib import Path
 
+from .chords import Chart
+
 log = logging.getLogger(__name__)
 
 
@@ -59,7 +61,7 @@ class Library:
 
     # --- changes ---
 
-    def add(self, title: str, filename: str, upload_path: Path) -> dict:
+    def add(self, title: str, filename: str, upload_path: Path, chart: Chart | None = None) -> dict:
         song_id = uuid.uuid4().hex[:12]
         song_dir = self.songs_dir / song_id
         song_dir.mkdir()
@@ -76,9 +78,44 @@ class Library:
             "error": None,
             "duration": None,
             "tracks": [],
+            "chords": [],
+            "chart": None,
         }
+        if chart:
+            (song_dir / "chart.json").write_text(json.dumps(chart.to_dict(), indent=2))
+            meta["chart"] = chart.to_dict()
         with self._lock:
             self._save(meta)
+        self._queue.put(song_id)
+        return meta
+
+    def chart(self, song_id: str) -> Chart | None:
+        try:
+            data = json.loads((self.songs_dir / song_id / "chart.json").read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+        return Chart(data.get("key"), data.get("chords", []), data.get("sections", []))
+
+    def set_chart(self, song_id: str, chart: Chart | None) -> dict | None:
+        """Save (or remove, with None) the song's chord chart and remake its tracks."""
+        meta = self.get(song_id)
+        if meta is None:
+            return None
+        path = self.songs_dir / song_id / "chart.json"
+        if chart is None:
+            path.unlink(missing_ok=True)
+        else:
+            path.write_text(json.dumps(chart.to_dict(), indent=2))
+        summary = chart.to_dict() if chart else None
+        revision = meta.get("revision", 0) + 1
+        if meta["status"] == "queued":
+            return self._update(song_id, chart=summary)  # read when its turn comes
+        if meta["status"] == "processing":
+            # It's being made with the old chart; it goes again with the new one when done.
+            return self._update(song_id, chart=summary, revision=revision)
+        separated = (self.songs_dir / song_id / "original" / "drums.m4a").exists()
+        meta = self._update(song_id, chart=summary, revision=revision, job="rebuild" if separated else None,
+                            status="queued", step="Waiting its turn", progress=0.0, error=None)
         self._queue.put(song_id)
         return meta
 
@@ -127,11 +164,12 @@ class Library:
             self._process(meta)
 
     def _process(self, meta: dict) -> None:
-        from .pipeline import process_song
+        from .pipeline import process_song, rebuild_tracks
 
         song_id = meta["id"]
         song_dir = self.songs_dir / song_id
         started = time.time()
+        revision = meta.get("revision", 0)
 
         def on_progress(step: str, fraction: float) -> None:
             if self.get(song_id) is None:
@@ -140,9 +178,18 @@ class Library:
 
         try:
             on_progress("Starting", 0.0)
-            result = process_song(song_dir, song_dir / meta["source"], self.soundfont, on_progress)
-            self._update(song_id, status="ready", step="Ready", progress=1.0, **result,
-                         processing_seconds=round(time.time() - started))
+            chart = self.chart(song_id)
+            if meta.get("job") == "rebuild":
+                result = rebuild_tracks(song_dir, self.soundfont, chart, on_progress)
+            else:
+                result = process_song(song_dir, song_dir / meta["source"], self.soundfont, on_progress, chart=chart)
+            changed = self.get(song_id).get("revision", 0) != revision
+            self._update(song_id, **result, processing_seconds=round(time.time() - started), version=time.time())
+            if changed:  # the chart changed while this ran
+                self._update(song_id, status="queued", job="rebuild", step="Waiting its turn", progress=0.0)
+                self._queue.put(song_id)
+            else:
+                self._update(song_id, status="ready", step="Ready", progress=1.0, job=None)
             log.info("Finished %s in %.0fs", meta["title"], time.time() - started)
         except _Deleted:
             shutil.rmtree(song_dir, ignore_errors=True)

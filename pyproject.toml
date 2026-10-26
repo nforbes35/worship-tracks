@@ -18,10 +18,15 @@ dependencies = [
     "uvicorn>=0.30",
     # Basic Pitch runs on Core ML on the Mac; on Linux (CI/testing) use ONNX instead.
     "onnxruntime>=1.18; sys_platform == 'linux'",
+    "pdfplumber>=0.11",
 ]
 
 [dependency-groups]
-dev = ["pytest>=8", "httpx>=0.27"]
+dev = [
+    "pytest>=8",
+    "httpx>=0.27",
+    "fpdf2>=2.8",
+]
 
 [tool.uv]
 # This is an app, not a library: nothing to build or publish.

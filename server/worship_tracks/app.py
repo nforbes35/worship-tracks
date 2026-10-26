@@ -14,12 +14,15 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .chords import Chart, parse_chart_text, read_chart
 from .library import Library
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+MAX_CHART_BYTES = 10 * 1024 * 1024
+CHART_TYPES = {".pdf", ".txt", ".cho", ".chopro", ".chordpro", ".pro"}
 AUDIO_TYPES = {".m4a": "audio/mp4", ".mid": "audio/midi"}
 WEB_DIR = Path(__file__).parent / "web"
 COOKIE = "wt_session"
@@ -92,21 +95,52 @@ def create_app(
     def list_songs():
         return library.list()
 
-    @app.post("/api/songs", status_code=201)
-    async def upload(file: UploadFile = File(...), title: str = Form("")):
-        if not file.filename:
-            raise HTTPException(400, "Choose a song file")
+    async def _save_upload(file: UploadFile, limit: int, suffix: str = ".upload") -> Path:
         size = 0
-        with tempfile.NamedTemporaryFile(delete=False, dir=library.songs_dir, suffix=".upload") as out:
+        with tempfile.NamedTemporaryFile(delete=False, dir=library.songs_dir, suffix=suffix) as out:
             tmp = Path(out.name)
             while chunk := await file.read(1024 * 1024):
                 size += len(chunk)
-                if size > MAX_UPLOAD_BYTES:
+                if size > limit:
                     out.close()
                     tmp.unlink(missing_ok=True)
-                    raise HTTPException(413, "That file is too big (200 MB max)")
+                    raise HTTPException(413, f"That file is too big ({limit // (1024 * 1024)} MB max)")
                 out.write(chunk)
-        return library.add(title, file.filename, tmp)
+        return tmp
+
+    async def _read_chart(file: UploadFile | None, text: str) -> Chart | None:
+        """A chart from an uploaded file (PDF, ChordPro, text) or typed-in text."""
+        try:
+            if file is not None and file.filename:
+                suffix = Path(file.filename).suffix.lower()
+                if suffix not in CHART_TYPES:
+                    raise ValueError("Chord charts can be PDF, ChordPro or text files")
+                path = await _save_upload(file, MAX_CHART_BYTES, suffix)
+                try:
+                    return read_chart(path)
+                finally:
+                    path.unlink(missing_ok=True)
+            if text.strip():
+                chart = parse_chart_text(text)
+                if not chart.chords:
+                    raise ValueError("Couldn't find any chords in that. Write them like: G  D  Em  C")
+                return chart
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return None
+
+    @app.post("/api/songs", status_code=201)
+    async def upload(
+        file: UploadFile = File(...),
+        title: str = Form(""),
+        chart: UploadFile | None = File(None),
+        chart_text: str = Form(""),
+    ):
+        if not file.filename:
+            raise HTTPException(400, "Choose a song file")
+        parsed = await _read_chart(chart, chart_text)
+        tmp = await _save_upload(file, MAX_UPLOAD_BYTES)
+        return library.add(title, file.filename, tmp, parsed)
 
     def _song_or_404(song_id: str) -> dict:
         meta = library.get(song_id)
@@ -125,6 +159,20 @@ def create_app(
     def rename(song_id: str, body: Rename):
         _song_or_404(song_id)
         return library.rename(song_id, body.title)
+
+    @app.post("/api/songs/{song_id}/chart")
+    async def set_chart(song_id: str, file: UploadFile | None = File(None), text: str = Form("")):
+        _song_or_404(song_id)
+        chart = await _read_chart(file, text)
+        if chart is None:
+            raise HTTPException(400, "Choose a chord chart or type the chords")
+        return library.set_chart(song_id, chart)
+
+    @app.delete("/api/songs/{song_id}/chart")
+    def remove_chart(song_id: str):
+        if _song_or_404(song_id).get("chart") is None:
+            raise HTTPException(404, "This song has no chord chart")
+        return library.set_chart(song_id, None)
 
     @app.post("/api/songs/{song_id}/retry")
     def retry(song_id: str):

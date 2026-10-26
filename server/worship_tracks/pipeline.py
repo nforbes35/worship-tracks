@@ -15,7 +15,8 @@ from pathlib import Path
 import numpy as np
 import pretty_midi
 
-from . import audio
+from . import arrange, audio
+from .chords import Chart
 from .instruments import TRACKS, Track
 from .transcribe import Note, transcribe_drums, transcribe_pitched
 
@@ -91,15 +92,13 @@ def process_song(
     soundfont: Path,
     on_progress: Progress,
     separate_fn: Callable[[np.ndarray, Callable[[float], None]], dict[str, np.ndarray]] = separate,
+    chart: Chart | None = None,
 ) -> dict:
     """Builds `song_dir/tracks/<id>.m4a` (recreated) and `song_dir/original/<id>.m4a`
     (the separated stem, for comparison). Returns the metadata the player needs."""
     audio.require_tools()
-    tracks_dir = song_dir / "tracks"
     original_dir = song_dir / "original"
-    midi_dir = song_dir / "midi"
-    for d in (tracks_dir, original_dir, midi_dir):
-        d.mkdir(parents=True, exist_ok=True)
+    original_dir.mkdir(parents=True, exist_ok=True)
 
     with tempfile.TemporaryDirectory(prefix="worship-tracks-") as tmp_name:
         tmp = Path(tmp_name)
@@ -111,26 +110,69 @@ def process_song(
 
         on_progress("Listening for each instrument", 0.03)
         stems = separate_fn(mix, lambda f: on_progress("Listening for each instrument", 0.03 + 0.5 * f))
-        mix_rms = audio.rms(mix)
-
-        results = []
-        step = 0.45 / len(TRACKS)
-        for i, track in enumerate(TRACKS):
-            base = 0.53 + i * step
-            stem = stems[track.stem]
+        for track in TRACKS:
             stem_wav = tmp / f"{track.stem}.wav"
-            audio.write(stem_wav, stem)
+            audio.write(stem_wav, stems[track.stem])
             audio.encode_m4a(stem_wav, original_dir / f"{track.id}.m4a", duration)
 
+    mono = {name: stem.mean(axis=0) for name, stem in stems.items()}
+    return build_tracks(song_dir, mono, mix.mean(axis=0), duration, soundfont, chart,
+                        lambda step, f: on_progress(step, 0.53 + 0.47 * f))
+
+
+def rebuild_tracks(song_dir: Path, soundfont: Path, chart: Chart | None, on_progress: Progress) -> dict:
+    """Make the tracks again (e.g. with a new chord chart) from the stems already saved,
+    without separating the song again."""
+    audio.require_tools()
+    with tempfile.TemporaryDirectory(prefix="worship-tracks-") as tmp_name:
+        tmp = Path(tmp_name)
+        on_progress("Reading the song", 0.02)
+        duration = audio.decode(song_dir / "mix.m4a", tmp / "mix.wav")
+        mix = audio.read(tmp / "mix.wav")[0]
+        stems = {}
+        for track in TRACKS:
+            audio.decode(song_dir / "original" / f"{track.id}.m4a", tmp / f"{track.id}.wav")
+            stems[track.stem] = audio.read(tmp / f"{track.id}.wav")[0]
+    return build_tracks(song_dir, stems, mix, duration, soundfont, chart,
+                        lambda step, f: on_progress(step, 0.05 + 0.95 * f))
+
+
+def build_tracks(
+    song_dir: Path,
+    stems: dict[str, np.ndarray],
+    mix: np.ndarray,
+    duration: float,
+    soundfont: Path,
+    chart: Chart | None,
+    on_progress: Progress,
+) -> dict:
+    """Transcribe each (mono) stem and play it back. With a chart, chordal parts play
+    the chart's chords instead of the notes the AI heard."""
+    tracks_dir = song_dir / "tracks"
+    midi_dir = song_dir / "midi"
+    for d in (tracks_dir, midi_dir):
+        d.mkdir(parents=True, exist_ok=True)
+    sr = audio.SAMPLE_RATE
+    spans = None
+    if chart and chart.vocabulary:
+        on_progress("Following the chord chart", 0.0)
+        harmony = stems["guitar"] + stems["piano"] + stems["other"]
+        spans = arrange.recognise_chords(harmony, stems["bass"], mix, sr, duration, chart)
+
+    mix_rms = audio.rms(mix)
+    results = []
+    step = 0.9 / len(TRACKS)
+    with tempfile.TemporaryDirectory(prefix="worship-tracks-") as tmp_name:
+        tmp = Path(tmp_name)
+        for i, track in enumerate(TRACKS):
+            base = 0.1 + i * step
+            stem = stems[track.stem]
             if audio.rms(stem) < mix_rms * SILENT_STEM_RATIO:
                 results.append(_track_info(track, notes=0, present=False))
                 continue
 
             on_progress(f"Writing down the {track.label.lower()} part", base)
-            if track.is_drum:
-                notes = transcribe_drums(stem, audio.SAMPLE_RATE)
-            else:
-                notes = transcribe_pitched(str(stem_wav), track)
+            notes = _notes_for(track, stem, tmp, spans, chart, duration)
             if not notes:
                 results.append(_track_info(track, notes=0, present=False))
                 continue
@@ -146,7 +188,48 @@ def process_song(
             results.append(_track_info(track, notes=len(notes), present=True))
 
     on_progress("Done", 1.0)
-    return {"duration": duration, "tracks": results}
+    return {
+        "duration": duration,
+        "tracks": results,
+        "chords": [s.to_dict() for s in spans] if spans else [],
+    }
+
+
+def _notes_for(track: Track, stem: np.ndarray, tmp: Path, spans, chart: Chart | None, duration: float) -> list[Note]:
+    sr = audio.SAMPLE_RATE
+    if track.is_drum:
+        return transcribe_drums(stem, sr)
+    if spans and track.id in ("guitar", "keys"):
+        times, strengths = arrange.onsets(stem, sr)
+        if track.id == "guitar":
+            return arrange.chord_hits(spans, times, strengths, arrange.guitar_voicing, duration, strum=0.012)
+        return arrange.chord_hits(spans, times, strengths, _piano_voicing(), duration)
+    if spans and track.id == "pads":
+        return arrange.pad_notes(spans, stem, sr)
+
+    stem_wav = tmp / f"{track.id}-stem.wav"
+    audio.write(stem_wav, stem)
+    notes = transcribe_pitched(str(stem_wav), track)
+    if spans and track.id == "bass":
+        notes = arrange.bass_on_changes(arrange.snap_bass(notes, spans), spans, stem, sr)
+    if chart and track.id == "melody":
+        notes = arrange.snap_to_key(notes, chart.key)
+    return notes
+
+
+def _piano_voicing():
+    """Left hand: the bass note. Right hand: the chord close to middle C, moving as little
+    as possible from the last chord."""
+    previous: list[int] = []
+
+    def voicing(chord):
+        nonlocal previous
+        center = int(np.mean(previous)) if previous else 64
+        right = arrange._voicing_near(chord, center, 3)
+        previous = right
+        return [36 + (chord.bass - 0) % 12, *right]
+
+    return voicing
 
 
 def _track_info(track: Track, notes: int, present: bool) -> dict:

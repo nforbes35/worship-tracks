@@ -16,6 +16,17 @@ In the player, every track also has an **Original** switch. It plays the real in
 
 **What to expect:** drums, bass, keys and melody come out close to the original. Guitar is recreated as clean chords, but strumming patterns and effects are simplified. Pads catch the main chords. Recreated tracks sound like a good MIDI arrangement of the song, not the original band.
 
+### Add a chord chart for much better results
+
+On a real recording the AI hears plenty of notes that aren't there, and the guitar, keys and pads suffer most. Add the song's **chord chart** (a SongSelect PDF, a ChordPro file, or chords typed in like `G D Em C`) when uploading, or later from the song's page, and:
+
+- the AI works out which of the chart's chords is playing on each beat;
+- guitar, keys and pads play exactly those chords, in the rhythm heard in the recording;
+- bass notes are moved onto the chord, and the melody is kept in key;
+- the player shows the current and next chord as the song plays.
+
+Adding or changing a chart takes a few seconds, since the song doesn't need to be separated again. The chart only has to list the song's chords; the order and repeats don't need to match the recording. Scanned PDFs (pictures of a page) have no text to read, so type the chords for those.
+
 ## Setting up the Mac mini (one time)
 
 You need an Apple Silicon Mac (M1 or newer) and about 5 GB of free space.
@@ -103,6 +114,8 @@ uv run python tests/eval_transcription.py   # transcription accuracy per instrum
 
 - `server/worship_tracks/pipeline.py`: song in, tracks out (separate → transcribe → render).
 - `server/worship_tracks/transcribe.py`: Basic Pitch wrapper, note cleanup, and the drum transcriber.
+- `server/worship_tracks/chords.py`: chord symbols, and reading chord charts (PDF, ChordPro, text).
+- `server/worship_tracks/arrange.py`: with a chart, finds the chord on each beat (Viterbi over beat-synced chroma) and builds the guitar, keys, pad and bass parts from it.
 - `server/worship_tracks/instruments.py`: the tracks, their sounds and transcription settings.
 - `server/worship_tracks/library.py`: song storage and the one-at-a-time processing queue.
 - `server/worship_tracks/app.py`: the FastAPI web server.

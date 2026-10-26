@@ -1,11 +1,13 @@
 import time
 
 import numpy as np
+import pretty_midi
 import pytest
 import soundfile as sf
 from fastapi.testclient import TestClient
 from worship_tracks import audio, library, pipeline
 from worship_tracks.app import create_app
+from worship_tracks.chords import parse_chart_text, parse_chord
 from worship_tracks.instruments import TRACKS
 
 
@@ -106,3 +108,65 @@ def test_real_separation(synthetic_song):
         n = min(truth.shape[1], separated[name].shape[1])
         error = audio.rms(separated[name][:, :n] - truth[:, :n])
         assert error < audio.rms(truth[:, :n]) * 0.7, name
+
+
+def test_chart_guided_tracks_play_only_chart_chords(tmp_path, soundfont, synthetic_song, fake_separator):
+    song_wav, _, _ = synthetic_song
+    chart = parse_chart_text("Key: G\nG  D  Em  C\nC  G/B  Am7  D")
+    result = pipeline.process_song(tmp_path, song_wav, soundfont, lambda *_: None,
+                                   separate_fn=fake_separator, chart=chart)
+
+    played = [c["chord"] for c in result["chords"] if c["chord"]]
+    assert played == ["G", "D", "Em", "C"]  # the song's four bars
+
+    for track_id in ("guitar", "keys", "pads"):
+        midi = pretty_midi.PrettyMIDI(str(tmp_path / "midi" / f"{track_id}.mid"))
+        notes = midi.instruments[0].notes
+        assert notes, track_id
+        for note in notes:
+            chord = parse_chord(next(c["chord"] for c in result["chords"]
+                                     if c["start"] <= note.start + 0.03 < c["end"]))
+            assert note.pitch % 12 in chord.tones, (track_id, note)
+
+
+def test_adding_a_chart_rebuilds_without_separating_again(tmp_path, soundfont, synthetic_song, fake_separator,
+                                                          monkeypatch):
+    song_wav, _, _ = synthetic_song
+    separations = []
+
+    def counting_separator(mix, progress):
+        separations.append(1)
+        return fake_separator(mix, progress)
+
+    real = pipeline.process_song
+    monkeypatch.setattr(pipeline, "process_song",
+                        lambda *args, **kwargs: real(*args, separate_fn=counting_separator, **kwargs))
+    app = create_app(data_dir=tmp_path, soundfont=soundfont, passcode="")
+
+    def wait_ready(client, song_id):
+        deadline = time.time() + 300
+        while (song := client.get(f"/api/songs/{song_id}").json())["status"] not in ("ready", "failed"):
+            assert time.time() < deadline, song
+            time.sleep(0.3)
+        assert song["status"] == "ready", song["error"]
+        return song
+
+    with TestClient(app) as client:
+        with open(song_wav, "rb") as f:
+            song_id = client.post("/api/songs", files={"file": ("song.wav", f, "audio/wav")}).json()["id"]
+        before = wait_ready(client, song_id)
+        assert before["chords"] == [] and before["chart"] is None
+
+        bad = client.post(f"/api/songs/{song_id}/chart", data={"text": "Amazing grace how sweet"})
+        assert bad.status_code == 400
+
+        assert client.post(f"/api/songs/{song_id}/chart", data={"text": "Key: G\nG D Em C"}).status_code == 200
+        after = wait_ready(client, song_id)
+        assert after["chart"]["unique"] == ["G", "D", "Em", "C"]
+        assert [c["chord"] for c in after["chords"] if c["chord"]] == ["G", "D", "Em", "C"]
+        assert after["version"] > before["version"]
+
+        assert client.delete(f"/api/songs/{song_id}/chart").status_code == 200
+        removed = wait_ready(client, song_id)
+        assert removed["chart"] is None and removed["chords"] == []
+    assert len(separations) == 1
