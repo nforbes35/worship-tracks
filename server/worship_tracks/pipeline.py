@@ -18,7 +18,8 @@ import pretty_midi
 from . import arrange, audio
 from .chords import Chart
 from .instruments import TRACKS, Track
-from .transcribe import Note, transcribe_drums, transcribe_pitched
+from .rhythm import Grid, lock_to_grid, make_grid
+from .transcribe import Note, make_monophonic, transcribe_drums, transcribe_pitched
 
 # Some Demucs operations have no Apple GPU version yet; run those on the CPU.
 # This must be set before PyTorch is first imported.
@@ -29,6 +30,8 @@ log = logging.getLogger(__name__)
 DEMUCS_MODEL = "htdemucs_6s"
 # A stem quieter than this, relative to the full mix, counts as "instrument not in the song".
 SILENT_STEM_RATIO = 0.04
+# Bass parts stay below about E3; notes above are usually the singer leaking into the bass.
+BASS_TOP = 52
 
 Progress = Callable[[str, float], None]
 
@@ -153,11 +156,13 @@ def build_tracks(
     for d in (tracks_dir, midi_dir):
         d.mkdir(parents=True, exist_ok=True)
     sr = audio.SAMPLE_RATE
+    on_progress("Finding the beat", 0.0)
+    grid = make_grid(mix, sr, duration, chart.tempo if chart else None, chart.time if chart else None)
     spans = None
     if chart and chart.vocabulary:
-        on_progress("Following the chord chart", 0.0)
+        on_progress("Following the chord chart", 0.03)
         harmony = stems["guitar"] + stems["piano"] + stems["other"]
-        spans = arrange.recognise_chords(harmony, stems["bass"], mix, sr, duration, chart)
+        spans = arrange.recognise_chords(harmony, stems["bass"], sr, duration, chart, grid)
 
     mix_rms = audio.rms(mix)
     results = []
@@ -172,7 +177,7 @@ def build_tracks(
                 continue
 
             on_progress(f"Writing down the {track.label.lower()} part", base)
-            notes = _notes_for(track, stem, tmp, spans, chart, duration)
+            notes = _notes_for(track, stem, tmp, grid, spans, chart, duration)
             if not notes:
                 results.append(_track_info(track, notes=0, present=False))
                 continue
@@ -195,23 +200,35 @@ def build_tracks(
     }
 
 
-def _notes_for(track: Track, stem: np.ndarray, tmp: Path, spans, chart: Chart | None, duration: float) -> list[Note]:
+def _notes_for(track: Track, stem: np.ndarray, tmp: Path, grid: Grid, spans, chart: Chart | None,
+               duration: float) -> list[Note]:
     sr = audio.SAMPLE_RATE
     if track.is_drum:
-        return transcribe_drums(stem, sr)
-    if spans and track.id in ("guitar", "keys"):
-        times, strengths = arrange.onsets(stem, sr)
+        return arrange.lock_notes(transcribe_drums(stem, sr), grid, even_out=True)
+    if spans and track.id in ("guitar", "keys", "bass"):
+        # (lowest Hz, highest Hz, how strong a hit must be next to the playing around it,
+        #  how much of the player's usual playing a place in the bar needs to keep its hits)
+        low, high, keep, pattern = {"guitar": (80, 3000, 0.35, 0.5), "keys": (60, 3000, 0.45, 0.6),
+                                    "bass": (30, 300, 0.55, 0.6)}[track.id]
+        hits = lock_to_grid(*arrange.onsets(stem, sr, low, high), grid, keep=keep, pattern=pattern)
         if track.id == "guitar":
-            return arrange.chord_hits(spans, times, strengths, arrange.guitar_voicing, duration, strum=0.012)
-        return arrange.chord_hits(spans, times, strengths, _piano_voicing(), duration)
+            return arrange.chord_hits(spans, hits, grid, arrange.guitar_voicing, duration, strum=0.012,
+                                      up_strums=True)
+        if track.id == "keys":
+            return arrange.chord_hits(spans, hits, grid, _piano_voicing(), duration)
+        return arrange.bass_line(spans, hits, grid, duration)
     if spans and track.id == "pads":
         return arrange.pad_notes(spans, stem, sr)
 
     stem_wav = tmp / f"{track.id}-stem.wav"
     audio.write(stem_wav, stem)
     notes = transcribe_pitched(str(stem_wav), track)
-    if spans and track.id == "bass":
-        notes = arrange.bass_on_changes(arrange.snap_bass(notes, spans), spans, stem, sr)
+    if track.id == "bass":
+        notes = [n for n in notes if n.pitch <= BASS_TOP]  # higher is the singer leaking in
+    if track.id in ("guitar", "keys", "pads", "bass"):
+        notes = arrange.lock_notes(notes, grid)
+        if track.monophonic:
+            notes = make_monophonic(notes)
     if chart and track.id == "melody":
         notes = arrange.snap_to_key(notes, chart.key)
     return notes

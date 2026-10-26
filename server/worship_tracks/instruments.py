@@ -28,14 +28,14 @@ class Track:
 
 TRACKS: list[Track] = [
     Track("drums", "Drums", stem="drums", is_drum=True),
-    Track("bass", "Bass", stem="bass", program=33, monophonic=True, min_hz=30, max_hz=400,
+    Track("bass", "Bass", stem="bass", program=33, monophonic=True, min_hz=30, max_hz=180,
           onset_threshold=0.45, min_note_ms=80),
     Track("guitar", "Guitar", stem="guitar", program=25, min_hz=75, max_hz=1400, pan=-0.35),
     Track("keys", "Keys", stem="piano", program=0, min_hz=27.5, max_hz=4200, pan=0.3),
     Track("pads", "Pads & other", stem="other", program=89, min_hz=55, max_hz=2000,
           onset_threshold=0.55, frame_threshold=0.25, min_note_ms=150, merge_gap=0.35, pan=0.15),
     Track("melody", "Vocal melody", stem="vocals", program=73, monophonic=True, min_hz=80,
-          max_hz=1100, onset_threshold=0.55, frame_threshold=0.35, min_note_ms=90),
+          max_hz=1100, onset_threshold=0.6, frame_threshold=0.35, min_note_ms=120, merge_gap=0.15),
 ]
 
 TRACKS_BY_ID = {t.id: t for t in TRACKS}

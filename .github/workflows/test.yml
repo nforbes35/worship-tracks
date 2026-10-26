@@ -18,3 +18,5 @@ jobs:
       - run: uv run pytest -q
       - name: Transcription accuracy on the synthetic song
         run: uv run python tests/eval_transcription.py
+      - name: Whole-pipeline scores on the live-style song
+        run: uv run python tests/eval_live.py
