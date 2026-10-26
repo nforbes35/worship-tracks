@@ -94,7 +94,7 @@ class Library:
             data = json.loads((self.songs_dir / song_id / "chart.json").read_text())
         except (FileNotFoundError, json.JSONDecodeError):
             return None
-        return Chart(data.get("key"), data.get("chords", []), data.get("sections", []))
+        return Chart.from_dict(data)
 
     def set_chart(self, song_id: str, chart: Chart | None) -> dict | None:
         """Save (or remove, with None) the song's chord chart and remake its tracks."""

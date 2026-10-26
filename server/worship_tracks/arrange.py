@@ -29,10 +29,11 @@ class ChordSpan:
 
 # ---------- finding the chords ----------
 
-def beat_times(mix: np.ndarray, sr: int, duration: float) -> np.ndarray:
+def beat_times(mix: np.ndarray, sr: int, duration: float, tempo: float | None = None) -> np.ndarray:
     import librosa
 
-    _, beats = librosa.beat.beat_track(y=mix, sr=sr, hop_length=HOP, units="time", trim=False)
+    _, beats = librosa.beat.beat_track(y=mix, sr=sr, hop_length=HOP, units="time", trim=False,
+                                       start_bpm=tempo or 120.0)
     if len(beats) < 4:  # free time or no clear pulse: fall back to half-second steps
         beats = np.arange(0, duration, 0.5)
     # Cover the whole song, from 0 to the end.
@@ -49,7 +50,7 @@ def recognise_chords(harmony: np.ndarray, bass: np.ndarray, mix: np.ndarray, sr:
     import librosa
 
     vocabulary = chart.vocabulary
-    grid = beat_times(mix, sr, duration)
+    grid = beat_times(mix, sr, duration, chart.tempo)
     frames = librosa.time_to_frames(grid, sr=sr, hop_length=HOP)
 
     def synced_chroma(y: np.ndarray) -> np.ndarray:
@@ -87,6 +88,12 @@ def recognise_chords(harmony: np.ndarray, bass: np.ndarray, mix: np.ndarray, sr:
     for a, b in itertools.pairwise(seq):
         if a != b:
             follows[a, b] += 3.0
+    # Charts often write variants of one chord (C, Csus4, C2sus4). Hopping between those on
+    # a held chord would re-strum it, so make those changes less likely than real ones.
+    for a, ca in enumerate(vocabulary):
+        for b, cb in enumerate(vocabulary):
+            if a != b and ca.root == cb.root and ca.bass == cb.bass:
+                follows[a, b] *= 0.3
     log_trans = np.log(np.full((n_states, n_states), 0.12 / n_states) * follows)
     np.fill_diagonal(log_trans, np.log(0.85))
 
@@ -165,9 +172,11 @@ def chord_hits(spans, times, strengths, voicing, end_of_song, strum=0.0, fill_ch
     times = list(times)
     strengths = list(strengths)
     if fill_changes and times:
-        for span in spans[1:]:
+        for previous, span in zip(spans, spans[1:]):
             if span.chord is None:
                 continue
+            if previous.chord and (previous.chord.root, previous.chord.bass) == (span.chord.root, span.chord.bass):
+                continue  # just a variant (C to Csus4): no new strum needed
             near = min(abs(t - span.start) for t in times)
             playing = any(span.start - 2.0 < t < span.start for t in times)
             if near > 0.12 and playing:

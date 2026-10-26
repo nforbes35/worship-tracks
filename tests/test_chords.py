@@ -113,3 +113,42 @@ def test_read_pdf_chart(tmp_path, columns):
 def test_scanned_pdf_is_explained(tmp_path):
     with pytest.raises(ValueError, match="scan"):
         read_chart(make_pdf(tmp_path / "scan.pdf", with_text=False))
+
+
+# Laid out the way SongSelect chord sheets come out of the PDF (made-up words).
+SONGSELECT = """\
+Song Title (Live)
+Artist Name
+I V1 C V2 C B Vp C B Vp
+INTRO
+I
+Piano in softly
+C C2sus4 C Csus4
+VERSE 1
+V1
+C
+Words go here
+F/C C
+More words here
+CHORUS
+C
+Full Band (except Drums)
+Am7 Gadd4
+Sing it out
+BRIDGE
+B
+Build
+C/E F2
+Hallelujah
+E1 D1 C1
+Page: 1/4
+Key: C Tempo: 75 Time: 6/8
+"""
+
+
+def test_songselect_layout():
+    chart = parse_chart_text(SONGSELECT)
+    assert (chart.key, chart.tempo, chart.time) == ("C", 75.0, "6/8")
+    assert chart.sections == ["INTRO", "VERSE 1", "CHORUS", "BRIDGE"]
+    # The section codes under each heading ("C" for chorus, "B" for bridge) aren't chords.
+    assert chart.chords == ["C", "C2sus4", "C", "Csus4", "C", "F/C", "C", "Am7", "Gadd4", "C/E", "F2"]

@@ -28,6 +28,11 @@ _SECTION_RE = re.compile(
     r"\s*\d*\s*:?\s*$",
     re.IGNORECASE,
 )
+# SongSelect prints a short code under each section heading (I, V1, C, B, Vp...).
+# "C" and "B" would otherwise read as chords.
+_SECTION_CODE_RE = re.compile(r"^(I|In|Int|V\d*|Vp|PC\d*|Pc\d*|C\d*|Ch\d*|B\d*|Br\d*|T|Tg|Tag|O|Out|E|End|Ins|Inst|R|TA)$")
+_TEMPO_RE = re.compile(r"\bTempo\s*[-:=–]?\s*(\d{2,3}(?:\.\d+)?)", re.IGNORECASE)
+_TIME_RE = re.compile(r"\bTime\s*(?:Signature)?\s*[-:=–]?\s*(\d{1,2}/\d{1,2})", re.IGNORECASE)
 _INLINE_RE = re.compile(r"\[([^\]\s]{1,12})\]")
 
 
@@ -122,6 +127,8 @@ class Chart:
     key: str | None
     chords: list[str]  # every chord in the order written, repeats included
     sections: list[str] = field(default_factory=list)
+    tempo: float | None = None  # beats per minute, as printed on the chart
+    time: str | None = None  # time signature, e.g. "6/8"
 
     @property
     def vocabulary(self) -> list[Chord]:
@@ -132,8 +139,13 @@ class Chart:
         return list(seen.values())
 
     def to_dict(self) -> dict:
-        return {"key": self.key, "chords": self.chords, "sections": self.sections,
-                "unique": [c.name for c in self.vocabulary]}
+        return {"key": self.key, "tempo": self.tempo, "time": self.time, "chords": self.chords,
+                "sections": self.sections, "unique": [c.name for c in self.vocabulary]}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Chart":
+        return cls(data.get("key"), data.get("chords", []), data.get("sections", []),
+                   data.get("tempo"), data.get("time"))
 
 
 def _chord_line(tokens: list[str]) -> list[str] | None:
@@ -149,18 +161,28 @@ def _chord_line(tokens: list[str]) -> list[str] | None:
 
 
 def parse_chart_text(text: str) -> Chart:
-    key = None
+    key = tempo = time = None
     chords: list[str] = []
     sections: list[str] = []
+    after_heading = False
     for raw in text.splitlines():
         line = raw.strip()
         if not line:
             continue
         if key is None and (m := _KEY_RE.search(line)):
             key = m[1]
+        if tempo is None and (m := _TEMPO_RE.search(line)):
+            tempo = float(m[1])
+        if time is None and (m := _TIME_RE.search(line)):
+            time = m[1]
         if _SECTION_RE.match(line):
             sections.append(line.rstrip(":").strip())
+            after_heading = True
             continue
+        if after_heading and _SECTION_CODE_RE.match(line):
+            after_heading = False
+            continue
+        after_heading = False
         inline = _INLINE_RE.findall(line)
         if inline:  # ChordPro: [G]Amazing [C]grace
             chords += [c for c in inline if parse_chord(c)]
@@ -168,12 +190,10 @@ def parse_chart_text(text: str) -> Chart:
         found = _chord_line(line.replace("|", " | ").split())
         if found:
             chords += found
-    # A single capital letter in a lyric ("A", "I") could fool the line test, but a whole
-    # line of them can't. Single-letter "A" lines are rare enough to ignore.
     if key is None and chords:
         first = parse_chord(chords[0])
         key = NAMES[first.root] + ("m" if first.minor else "") if first else None
-    return Chart(key, chords, sections)
+    return Chart(key, chords, sections, tempo, time)
 
 
 def read_chart(path: Path) -> Chart:
