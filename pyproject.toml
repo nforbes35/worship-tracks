@@ -12,6 +12,8 @@ dependencies = [
     "pretty-midi>=0.2.10",
     "python-multipart>=0.0.9",
     "soundfile>=0.12",
+    # Basic Pitch needs resampy<0.4.3, which imports pkg_resources (removed in setuptools 81).
+    "setuptools<81",
     "torch>=2.4",
     "uvicorn>=0.30",
     # Basic Pitch runs on Core ML on the Mac; on Linux (CI/testing) use ONNX instead.
