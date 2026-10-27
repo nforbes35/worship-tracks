@@ -53,11 +53,8 @@ print('Models ready. Separation will run on:', pipeline._device())
 "
 
 say "Checking everything works"
-if ! uv run --group dev pytest -q -p no:warnings; then
-  echo
-  echo "Some checks failed. Copy everything above and send it to Claude to get it fixed." >&2
-  exit 1
-fi
+checks_failed=0
+uv run --group dev pytest -q -p no:warnings || checks_failed=1
 
 memory_gb=$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 ))
 if [[ "${WT_SKIP_AI_BAND:-}" == "1" ]]; then
@@ -70,7 +67,12 @@ else
   scripts/acestep.sh install
 fi
 
-say "Done"
+if (( checks_failed )); then
+  say "Done, but some checks failed"
+  echo "Everything is installed, but some checks above failed. Copy them and send them to Claude to get them fixed."
+else
+  say "Done"
+fi
 echo "Start everything, and have it start by itself from now on:"
 echo "  scripts/autostart.sh install"
 if [[ -d "${WT_ACESTEP_DIR:-$HOME/WorshipTracks/ACE-Step-1.5}/.venv" ]]; then
