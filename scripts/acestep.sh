@@ -30,7 +30,7 @@ case "${1:-}" in
     fi
     memory_gb=$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 ))
     # Its language model listens to songs to describe them. Bigger is better, if there's room.
-    if (( memory_gb >= 32 )); then
+    if (( memory_gb >= 24 )); then
       export ACESTEP_INIT_LLM=true ACESTEP_LM_MODEL_PATH="${WT_ACESTEP_LM:-acestep-5Hz-lm-1.7B}"
     elif (( memory_gb >= 16 )); then
       export ACESTEP_INIT_LLM=true ACESTEP_LM_MODEL_PATH="${WT_ACESTEP_LM:-acestep-5Hz-lm-0.6B}"
