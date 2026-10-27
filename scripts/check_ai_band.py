@@ -18,16 +18,53 @@ from worship_tracks import audio, backing
 from worship_tracks.acestep import AceStep
 
 
+ACE_DIR = Path(os.environ.get("WT_ACESTEP_DIR", Path.home() / "WorshipTracks/ACE-Step-1.5"))
+LOG = Path.home() / "WorshipTracks/logs/acestep.log"
+
+
+def agent_running() -> bool:
+    import subprocess
+
+    result = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/com.worshiptracks.acestep"],
+                            capture_output=True, text=True, check=False)
+    return result.returncode == 0
+
+
+def folder_size(path: Path) -> float:
+    """Gigabytes in a folder (to show the model download moving)."""
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file()) / 1e9 if path.exists() else 0.0
+
+
+def last_log_line() -> str:
+    try:
+        lines = [line for line in LOG.read_text(errors="replace").splitlines() if line.strip()]
+    except FileNotFoundError:
+        return ""
+    return lines[-1][:150] if lines else ""
+
+
 def main() -> int:
     engine = AceStep()
+    if not engine.available():
+        if not (ACE_DIR / ".venv").exists():
+            print(f"ACE-Step isn't installed (nothing in {ACE_DIR}).")
+            print("Run scripts/setup.sh and check it ends with \"Installing the AI band\" and \"Done\".")
+            return 1
+        if not agent_running():
+            print("ACE-Step is installed but not running. Start it with:  scripts/autostart.sh install")
+            return 1
     print(f"Waiting for ACE-Step at {engine.url} (the first start downloads about 10 GB)...")
     started = time.time()
     while not engine.available():
         if time.time() - started > 90 * 60:
-            print("ACE-Step didn't start. See ~/WorshipTracks/logs/acestep.log")
+            print(f"ACE-Step didn't start. See {LOG}")
             return 1
-        time.sleep(10)
-        print(f"  still starting ({int(time.time() - started) // 60} min)", flush=True)
+        time.sleep(15)
+        if not agent_running():
+            print(f"ACE-Step stopped. The end of {LOG} says why:\n  {last_log_line()}")
+            return 1
+        print(f"  still starting ({int(time.time() - started) // 60} min, "
+              f"{folder_size(ACE_DIR / 'checkpoints'):.1f} GB of models so far)  {last_log_line()[:70]}", flush=True)
 
     soundfont = Path(os.environ.get("WT_SOUNDFONT", Path.home() / "WorshipTracks/soundfonts/GeneralUser-GS.sf2"))
     with tempfile.TemporaryDirectory() as tmp:
