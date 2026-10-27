@@ -12,3 +12,10 @@ WT_DATA_DIR="$HOME/WorshipTracks"
 
 # The instrument sounds. Any General MIDI .sf2 SoundFont works.
 WT_SOUNDFONT="$HOME/WorshipTracks/soundfonts/GeneralUser-GS.sf2"
+
+# How tracks are made: "auto" uses the AI band (ACE-Step) when it's running, and plays
+# the song note by note when it isn't. "notes" always plays note by note.
+WT_ENGINE=auto
+
+# Where the AI band (ACE-Step) runs.
+WT_ACESTEP_URL=http://127.0.0.1:8001

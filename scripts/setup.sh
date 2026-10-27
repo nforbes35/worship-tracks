@@ -59,6 +59,21 @@ if ! uv run --group dev pytest -q -p no:warnings; then
   exit 1
 fi
 
+memory_gb=$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 ))
+if [[ "${WT_SKIP_AI_BAND:-}" == "1" ]]; then
+  echo "Skipping the AI band (WT_SKIP_AI_BAND=1)."
+elif (( memory_gb < 16 )); then
+  say "Skipping the AI band"
+  echo "This Mac has ${memory_gb} GB of memory; the AI band needs at least 16 GB. Tracks will be made note by note."
+else
+  say "Installing the AI band (ACE-Step, a few minutes)"
+  scripts/acestep.sh install
+fi
+
 say "Done"
-echo "Start the server now with:   scripts/start.sh"
-echo "Or have it start by itself:  scripts/autostart.sh install"
+echo "Start everything, and have it start by itself from now on:"
+echo "  scripts/autostart.sh install"
+if [[ -d "${WT_ACESTEP_DIR:-$HOME/WorshipTracks/ACE-Step-1.5}/.venv" ]]; then
+  echo "Then check the AI band works (its first start downloads about 10 GB):"
+  echo "  uv run python scripts/check_ai_band.py"
+fi

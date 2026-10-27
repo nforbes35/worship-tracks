@@ -264,6 +264,8 @@ async function playerView(song) {
       </div>
     </section>
 
+    ${layoutCard(song)}
+
     <h2>Tracks</h2>
     <ul class="tracks card" style="padding:0">
       ${tracks.map((t) => trackRow(t, saved.tracks[t.id] || {})).join("")}
@@ -277,6 +279,9 @@ async function playerView(song) {
     </ul>
     ${missing.length ? `<p class="small muted">Not found in this song: ${missing.map((t) => esc(t.label)).join(", ")}.</p>` : ""}
 
+    <h2>AI band</h2>
+    <div class="card stack" id="band-card">${bandCard(song)}</div>
+
     <h2>Chord chart</h2>
     <div class="card stack" id="chart-card">${chartCard(song)}</div>
 
@@ -285,7 +290,10 @@ async function playerView(song) {
 
     <h2>Song</h2>
     <div class="card stack">
-      <p class="small muted">The AI writes down each part and plays it back with virtual instruments. Switch a track to <b>Original</b> to hear the real instrument pulled out of the recording instead.</p>
+      <p class="small muted">${song.engine === "ai-band"
+        ? "These tracks are a new recording of the song by the AI band, split into instruments."
+        : "The AI writes down each part and plays it back with virtual instruments."}
+        Switch a track to <b>Original</b> to hear the real instrument pulled out of the recording instead.</p>
       <div class="row" style="flex-wrap:wrap">
         <button id="rename">Rename</button>
         <button class="danger" id="delete">Delete song</button>
@@ -302,15 +310,16 @@ async function playerView(song) {
 
   for (const t of tracks) {
     const s = saved.tracks[t.id] || {};
-    state[t.id] = { source: s.source === "original" ? "original" : "ai" };
+    state[t.id] = { source: t.ai === false || s.source === "original" ? "original" : "ai" };
     player.addChannel(t.id, { pan: t.pan, volume: s.volume ?? 1, muted: !!s.muted, solo: !!s.solo });
   }
   player.addChannel("mix", { volume: saved.tracks.mix?.volume ?? 0.8, muted: true });
   player.setMasterVolume(saved.master ?? 1);
 
+  const fixed = new Set(tracks.filter((t) => t.ai === false).map((t) => t.id));
   const urlFor = (id) =>
     id === "mix" ? `${base}/mix.m4a?v=${version}`
-      : `${base}/${state[id].source === "original" ? "original" : "tracks"}/${id}.m4a?v=${version}`;
+      : `${base}/${state[id].source === "original" && !fixed.has(id) ? "original" : "tracks"}/${id}.m4a?v=${version}`;
 
   const persist = () => {
     const mix = { master: Number(view.querySelector("#master").value), tracks: {} };
@@ -361,6 +370,7 @@ async function playerView(song) {
       seek.value = p;
       pos.textContent = fmt(p);
       showChord(p);
+      showSection(p);
     }
     raf = requestAnimationFrame(tick);
   };
@@ -416,6 +426,32 @@ async function playerView(song) {
     player.setLoop(!player.loop.on, loopStart, loopEnd);
     showLoop();
   };
+
+  // Song layout: tap a section to jump there; "Loop this section" loops the current one.
+  const sections = song.layout?.sections || [];
+  const sectionAt = (p) => sections.findIndex((s) => s.start <= p && p < s.end);
+  view.querySelectorAll(".layout .part").forEach((el) => {
+    el.onclick = () => player.seek(sections[Number(el.dataset.index)].start);
+  });
+  const loopSection = view.querySelector("#loop-section");
+  if (loopSection) {
+    loopSection.onclick = () => {
+      const s = sections[Math.max(0, sectionAt(player.position()))];
+      loopStart = s.start;
+      loopEnd = s.end;
+      player.setLoop(true, loopStart, loopEnd);
+      showLoop();
+    };
+  }
+  let shownSection = -1;
+  function showSection(p) {
+    const i = sectionAt(p);
+    if (i === shownSection) return;
+    shownSection = i;
+    view.querySelectorAll(".layout .part").forEach((el) => el.classList.toggle("now", Number(el.dataset.index) === i));
+    const label = view.querySelector("#section-now");
+    if (label) label.textContent = i >= 0 ? sections[i].name : "";
+  }
 
   // Track controls
   const refreshRows = () => {
@@ -484,6 +520,7 @@ async function playerView(song) {
   };
   view.querySelector("#delete").onclick = () => deleteSong(song);
   wireChartCard(song);
+  wireBandCard(song);
 
   cleanup = () => {
     cancelAnimationFrame(raf);
@@ -494,14 +531,15 @@ async function playerView(song) {
 
 function trackRow(t, saved) {
   const source = saved.source === "original" ? "original" : "ai";
-  return `
-    <li class="track" data-id="${t.id}">
-      <div>
-        <div class="name">${esc(t.label)}</div>
+  const choice = t.ai === false ? "" : `
         <div class="segmented" role="group" aria-label="${esc(t.label)} sound">
           <button data-source="ai" class="${source === "ai" ? "on" : ""}">AI</button>
           <button data-source="original" class="${source === "original" ? "on" : ""}">Original</button>
-        </div>
+        </div>`;
+  return `
+    <li class="track" data-id="${t.id}">
+      <div>
+        <div class="name">${esc(t.label)}</div>${choice}
       </div>
       <div class="controls">
         <button class="toggle mute" data-action="mute" aria-label="Mute ${esc(t.label)}">M</button>
@@ -515,8 +553,10 @@ function chartCard(song) {
   const chart = song.chart;
   const summary = chart
     ? `<p><b>Key of ${esc(chart.key || "?")}</b> · ${chart.unique.map(esc).join("  ")}</p>
-       <p class="small muted">Guitar, keys and pads play these chords, in the rhythm heard in the recording. Bass and melody are kept in key.</p>`
-    : `<p class="small muted">Add the song's chord chart and the guitar, keys, pads and bass will play the right chords instead of guessing every note. A PDF from SongSelect works, or type the chords.</p>`;
+       <p class="small muted">${song.engine === "ai-band"
+         ? "The chart sets the song's key, tempo, time signature and section names, and the chord display."
+         : "Guitar, keys and pads play these chords, in the rhythm heard in the recording. Bass and melody are kept in key."}</p>`
+    : `<p class="small muted">Add the song's chord chart to set its key, tempo, time signature and section names, and to show the chords as it plays. A PDF from SongSelect works, or type the chords.</p>`;
   return `${summary}
     <div class="row" style="flex-wrap:wrap">
       <label class="button"><input type="file" id="chart-file" hidden accept=".pdf,.txt,.cho,.chopro,.chordpro,.pro,application/pdf,text/plain">${chart ? "Replace chart" : "Add chord chart"}</label>
@@ -572,4 +612,94 @@ function wireChartCard(song) {
       if (confirm("Remove the chord chart and go back to the AI's own notes?")) send(undefined, "DELETE");
     };
   }
+}
+
+const SECTION_COLORS = { intro: 1, verse: 2, "pre-chorus": 3, prechorus: 3, chorus: 4, bridge: 5, vamp: 6, tag: 6,
+  instrumental: 1, interlude: 1, outro: 1, ending: 1, turnaround: 6 };
+
+function sectionColor(name) {
+  const base = name.toLowerCase().replace(/\s*\d+$/, "");
+  return SECTION_COLORS[base] || 7;
+}
+
+function layoutCard(song) {
+  const layout = song.layout;
+  if (!layout) return "";
+  const total = song.duration || 1;
+  const parts = layout.sections.map((s, i) => `
+      <button class="part c${sectionColor(s.name)}" data-index="${i}" style="flex-grow:${(s.end - s.start) / total}"
+        title="${esc(s.name)} · ${fmt(s.start)}–${fmt(s.end)}" aria-label="Jump to ${esc(s.name)} at ${fmt(s.start)}">
+        <span>${esc(s.name)}</span></button>`).join("");
+  const list = layout.sections.map((s) => `<li><span>${esc(s.name)}</span><span class="muted">${fmt(s.start)} · ${Math.round(s.end - s.start)}s</span></li>`).join("");
+  return `
+    <h2>Song layout</h2>
+    <section class="card stack">
+      <div class="facts"><b>${Math.round(layout.tempo)} BPM</b><b>${esc(layout.key)}</b><b>${esc(layout.time)}</b></div>
+      <div class="layout" role="group" aria-label="Sections">${parts}</div>
+      <div class="row"><span class="grow small">Now: <b id="section-now"></b></span><button id="loop-section">Loop this section</button></div>
+      <details><summary class="small">All sections</summary><ol class="sections small">${list}</ol></details>
+      <p class="small muted">${esc(layout.instruments)}</p>
+    </section>`;
+}
+
+function bandCard(song) {
+  const band = song.backing;
+  const caption = band?.caption || song.layout?.instruments || "";
+  const strength = band?.strength ?? 1;
+  const option = (value, label) => `<option value="${value}" ${Math.abs(strength - value) < 0.01 ? "selected" : ""}>${label}</option>`;
+  const notice = song.backing_error ? `<p class="notice small">${esc(song.backing_error)}</p>` : "";
+  const intro = song.engine === "ai-band"
+    ? "The AI band played this song from scratch, following its layout, chords and timing. Each take sounds different; describe a different sound or just make another take."
+    : "Have an AI band play the song from scratch, following its layout, chords and timing, for tracks that sound like real players.";
+  return `${notice}
+    <p class="small muted">${intro}</p>
+    <label class="stack small"><span>Sound</span>
+      <textarea id="band-caption" rows="3" maxlength="1000"
+        style="width:100%;font:inherit;padding:10px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text)">${esc(caption)}</textarea>
+    </label>
+    <label class="row small"><span>Follow the original</span>
+      <select id="band-strength" class="grow" style="font:inherit;min-height:44px;border-radius:10px;border:1px solid var(--border);background:var(--surface);color:var(--text)">
+        ${option(1, "Very closely")}${option(0.8, "Closely")}${option(0.6, "Loosely (more of its own ideas)")}
+      </select>
+    </label>
+    <div class="row" style="flex-wrap:wrap">
+      <button class="primary" id="band-take">${song.engine === "ai-band" ? "Make a new take" : "Make an AI band take"}</button>
+      ${song.engine === "ai-band" ? '<a class="button" id="band-download" download>Download the backing track</a>' : ""}
+    </div>
+    <p class="small error" id="band-msg" hidden></p>`;
+}
+
+function wireBandCard(song) {
+  const card = view.querySelector("#band-card");
+  const msg = card.querySelector("#band-msg");
+  const download = card.querySelector("#band-download");
+  if (download) {
+    download.href = `/api/songs/${song.id}/files/backing.m4a?v=${Math.round(song.version || 0)}`;
+    download.download = `${song.title} (backing).m4a`;
+  }
+  card.querySelector("#band-take").onclick = async () => {
+    msg.hidden = true;
+    try {
+      await api(`/songs/${song.id}/backing`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          caption: card.querySelector("#band-caption").value,
+          strength: Number(card.querySelector("#band-strength").value),
+        }),
+      });
+      route();
+    } catch (err) {
+      msg.textContent = err.message;
+      msg.hidden = false;
+    }
+  };
+  // Say up front if the AI band isn't running.
+  api("/engine").then(({ aiBand }) => {
+    if (!aiBand) {
+      card.querySelector("#band-take").disabled = true;
+      msg.textContent = "The AI band isn't running on the Mac mini. See \"AI band\" in the README to switch it on.";
+      msg.hidden = false;
+    }
+  }).catch(() => {});
 }

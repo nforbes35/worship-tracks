@@ -11,18 +11,22 @@ import threading
 import time
 import traceback
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
+from .acestep import AceStep, AceStepError
 from .chords import Chart
 
 log = logging.getLogger(__name__)
 
 
 class Library:
-    def __init__(self, data_dir: Path, soundfont: Path):
+    def __init__(self, data_dir: Path, soundfont: Path, engine_factory: Callable[[], AceStep | None] | None = None):
         self.songs_dir = data_dir / "songs"
         self.songs_dir.mkdir(parents=True, exist_ok=True)
         self.soundfont = soundfont
+        # Returns the AI band engine (ACE-Step) when it's running, else None.
+        self.engine_factory = engine_factory or (lambda: None)
         self._lock = threading.Lock()
         self._queue: queue.Queue[str] = queue.Queue()
         self._worker: threading.Thread | None = None
@@ -119,6 +123,19 @@ class Library:
         self._queue.put(song_id)
         return meta
 
+    def new_take(self, song_id: str, caption: str, strength: float) -> dict | None:
+        """Ask the AI band for a new recording (optionally in a different sound)."""
+        meta = self.get(song_id)
+        if meta is None:
+            return None
+        request = {"caption": caption.strip(), "strength": strength}
+        if meta["status"] in ("queued", "processing"):
+            return self._update(song_id, backing_request=request)
+        meta = self._update(song_id, backing_request=request, job="backing", status="queued",
+                            step="Waiting its turn", progress=0.0, error=None, backing_error=None)
+        self._queue.put(song_id)
+        return meta
+
     def rename(self, song_id: str, title: str) -> dict | None:
         return self._update(song_id, title=title.strip())
 
@@ -179,10 +196,30 @@ class Library:
         try:
             on_progress("Starting", 0.0)
             chart = self.chart(song_id)
-            if meta.get("job") == "rebuild":
-                result = rebuild_tracks(song_dir, self.soundfont, chart, on_progress)
+            job = meta.get("job")
+            settings = meta.get("backing_request")
+            engine = self.engine_factory()
+            backing_error = None
+            if job == "rebuild":
+                # A new chart: redo the analysis. Note-by-note tracks are remade with the new
+                # chords; an AI band recording is kept (make a new take to change it).
+                ai_band = meta.get("engine") == "ai-band"
+                result = rebuild_tracks(song_dir, self.soundfont, chart, on_progress,
+                                        engine=engine if ai_band else None, make_tracks=not ai_band)
+            elif job == "backing":
+                if engine is None:
+                    raise _NoEngine()
+                result = rebuild_tracks(song_dir, self.soundfont, chart, on_progress, engine=engine,
+                                        backing_settings=settings)
             else:
-                result = process_song(song_dir, song_dir / meta["source"], self.soundfont, on_progress, chart=chart)
+                try:
+                    result = process_song(song_dir, song_dir / meta["source"], self.soundfont, on_progress,
+                                          chart=chart, engine=engine, backing_settings=settings)
+                except AceStepError as exc:
+                    log.warning("The AI band failed for %s (%s); making note-by-note tracks", meta["title"], exc)
+                    backing_error = f"The AI band couldn't play this song ({exc}). These tracks are note by note."
+                    result = rebuild_tracks(song_dir, self.soundfont, chart, on_progress)
+            result["backing_error"] = backing_error
             changed = self.get(song_id).get("revision", 0) != revision
             self._update(song_id, **result, processing_seconds=round(time.time() - started), version=time.time())
             if changed:  # the chart changed while this ran
@@ -193,6 +230,12 @@ class Library:
             log.info("Finished %s in %.0fs", meta["title"], time.time() - started)
         except _Deleted:
             shutil.rmtree(song_dir, ignore_errors=True)
+        except (_NoEngine, AceStepError) as exc:
+            # A new take failed: keep the tracks the song already has.
+            message = ("The AI band isn't running on the Mac mini (see the README: AI band)."
+                       if isinstance(exc, _NoEngine) else f"The AI band couldn't play this song: {exc}")
+            log.warning("New take failed for %s: %s", meta["title"], message)
+            self._update(song_id, status="ready", step="Ready", progress=1.0, job=None, backing_error=message)
         except Exception as exc:
             log.error("Failed to process %s:\n%s", meta["title"], traceback.format_exc())
             self._update(song_id, status="failed", step="Something went wrong", error=str(exc)[:500])
@@ -200,6 +243,10 @@ class Library:
 
 class _Deleted(Exception):
     """The song was deleted while it was being processed."""
+
+
+class _NoEngine(Exception):
+    """A new AI band take was asked for, but ACE-Step isn't running."""
 
 
 def _valid_id(song_id: str) -> bool:

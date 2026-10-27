@@ -1,6 +1,6 @@
 # Worship Tracks
 
-Upload a song, and an AI running on your own Mac listens to it and recreates each instrument as its own play-along track: **drums, bass, guitar, keys, pads, and the vocal melody**. Your team opens it in a web browser on any phone, tablet or computer, mutes their own part, and plays along.
+Upload a song. An AI running on your own Mac works out its layout (sections, tempo, key, instruments) and has an **AI band** play a new backing track with the same layout and timing. The backing track is split into **drums, bass, guitar, keys and pads**, plus the original vocals as a guide. Your team opens it in a web browser on any phone, tablet or computer, mutes their own part, and plays along.
 
 - **Free.** It uses only open-source AI models and runs on your Mac. No subscriptions or cloud fees.
 - **Private.** Songs never leave your Mac.
@@ -9,27 +9,23 @@ Upload a song, and an AI running on your own Mac listens to it and recreates eac
 ## How it works
 
 1. **Listen.** [Demucs](https://github.com/adefossez/demucs) (from Meta) picks out each instrument in the recording.
-2. **Write it down.** [Basic Pitch](https://github.com/spotify/basic-pitch) (from Spotify) transcribes the notes of each instrument. Drums are detected by their hits (kick, snare, hi-hat, crash).
-3. **Play it back.** Each part is played on virtual instruments ([GeneralUser GS](https://github.com/mrbumpy409/GeneralUser-GS)) at the same volume it had in the original mix.
+2. **Lay out the song.** The app finds the beat, tempo, key and time signature, and splits the song into sections (intro, verses, choruses, bridge...) with their start times and lengths. [ACE-Step](https://github.com/ace-step/ACE-Step-1.5) listens too, and describes the style and instruments.
+3. **The AI band plays it.** ACE-Step 1.5, an open-source music generator (MIT licence), plays a brand-new recording of the song without the vocals ("cover" mode). It follows the song's structure, chords and timing, in the sound described under **AI band**. The app checks the new recording lines up with the original and nudges it into place.
+4. **Split for the team.** The new recording is split into instruments, so each musician can mute their own part.
 
-In the player, every track also has an **Original** switch. It plays the real instrument picked out of the recording instead of the recreation, which helps when the recreation of a part sounds rough.
+On each song's page you'll see the **song layout** (tap a section to jump there, or loop it) and the **AI band** settings. Change the description of the sound, choose how closely to follow the original, and make a **new take**. Every take comes out different. Every track also has an **Original** switch that plays the real instrument from the recording instead.
 
-**What to expect:** drums, bass, keys and melody come out close to the original. Guitar is recreated as clean chords, but strumming patterns and effects are simplified. Pads catch the main chords. Recreated tracks sound like a good MIDI arrangement of the song, not the original band.
+**What to expect:** the AI band sounds like real players, but it isn't the original arrangement. Parts, fills and voicings are its own. Bigger changes in a song (a breakdown, a key change) are followed more loosely than the basic chords and groove. If a take misses, make another.
 
-### Add a chord chart for much better results
+If the AI band isn't installed or running, the app makes tracks **note by note** instead: it writes down each part and plays it on virtual instruments. That's quicker but sounds much more like MIDI.
 
-On a real recording the AI hears plenty of notes that aren't there, and the guitar, keys and pads suffer most. Add the song's **chord chart** (a SongSelect PDF, a ChordPro file, or chords typed in like `G D Em C`) when uploading, or later from the song's page, and:
+### Add a chord chart
 
-- the AI works out which of the chart's chords is playing on each beat;
-- guitar, keys and pads play exactly those chords, in the rhythm heard in the recording;
-- bass notes are moved onto the chord, and the melody is kept in key;
-- the player shows the current and next chord as the song plays.
-
-Adding or changing a chart takes a few seconds, since the song doesn't need to be separated again. The chart only has to list the song's chords; the order and repeats don't need to match the recording. Scanned PDFs (pictures of a page) have no text to read, so type the chords for those.
+Add the song's **chord chart** (a SongSelect PDF, a ChordPro file, or chords typed in like `G D Em C`) when uploading, or later from the song's page. The chart's key, tempo, time signature and section names are then used for the song's layout and the AI band, and the player shows the current and next chord as the song plays. Scanned PDFs (pictures of a page) have no text to read, so type the chords for those.
 
 ## Setting up the Mac mini (one time)
 
-You need an Apple Silicon Mac (M1 or newer) and about 5 GB of free space.
+You need an Apple Silicon Mac (M1 or newer) and about 20 GB of free space. The AI band needs at least 16 GB of memory; with less, tracks are made note by note.
 
 1. **Install Homebrew** if you don't have it. Open **Terminal** and paste:
 
@@ -57,6 +53,14 @@ You need an Apple Silicon Mac (M1 or newer) and about 5 GB of free space.
    ```
 
    If macOS asks whether to allow incoming network connections, click **Allow**.
+
+   Then **check the AI band works**. The first time, ACE-Step downloads its models (about 10 GB), so this can take a while:
+
+   ```bash
+   uv run python scripts/check_ai_band.py
+   ```
+
+   It plays a short test song and saves the result as `ai-band-check.wav`, so you can hear it.
 
 4. **Keep the Mac awake.** In **System Settings → Energy**:
    - turn on **Prevent automatic sleeping when the display is off**
@@ -95,7 +99,8 @@ Then restart: `scripts/autostart.sh restart`. Changing the passcode later signs 
 | Restart the server | `scripts/autostart.sh restart` |
 | See what it's doing | `scripts/autostart.sh logs` |
 | Stop it starting automatically | `scripts/autostart.sh uninstall` |
-| Run it just in this Terminal window | `scripts/start.sh` |
+| See what the AI band is doing | `scripts/autostart.sh logs band` |
+| Run it just in this Terminal window | `scripts/start.sh` (and `scripts/acestep.sh run` in another for the AI band) |
 | Update to the newest version | `git pull && uv sync && scripts/autostart.sh restart` |
 
 Songs and tracks are stored in `~/WorshipTracks/songs`, one folder per song. Each song's folder also has a `midi` folder with every recreated part as a MIDI file, which you can open in GarageBand or Logic.
@@ -116,6 +121,9 @@ uv run python tests/eval_transcription.py   # transcription accuracy per instrum
 - `server/worship_tracks/transcribe.py`: Basic Pitch wrapper, note cleanup, and the drum transcriber.
 - `server/worship_tracks/chords.py`: chord symbols, and reading chord charts (PDF, ChordPro, text).
 - `server/worship_tracks/arrange.py`: with a chart, finds the chord on each beat (Viterbi over beat-synced chroma) and builds the guitar, keys, pad and bass parts from it.
+- `server/worship_tracks/structure.py`: the song's layout (sections, key).
+- `server/worship_tracks/acestep.py`, `backing.py`: the AI band: ACE-Step's API, generating a take and lining it up. `tests/fake_acestep.py` stands in for ACE-Step in tests.
+- `server/worship_tracks/rhythm.py`: the beat grid.
 - `server/worship_tracks/instruments.py`: the tracks, their sounds and transcription settings.
 - `server/worship_tracks/library.py`: song storage and the one-at-a-time processing queue.
 - `server/worship_tracks/app.py`: the FastAPI web server.

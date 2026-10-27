@@ -1,13 +1,16 @@
 """Song in, play-along tracks out.
 
-1. Decode the upload to WAV.
-2. Separate it into stems with Demucs, only so each instrument can be heard on its own.
-3. Transcribe each stem into notes.
-4. Play the notes back with SoundFont instruments, at the level the instrument had in the mix.
+1. Decode the upload and separate it into stems with Demucs.
+2. Work out the song's layout: tempo, key, time signature, sections, instruments.
+3. Make the tracks, either:
+   - AI band (when ACE-Step is running): a new recording of the song by ACE-Step,
+     following its structure, chords and timing, then split into instruments; or
+   - note by note: transcribe each stem and play the notes on SoundFont instruments.
 """
 
 import logging
 import os
+import shutil
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -15,7 +18,8 @@ from pathlib import Path
 import numpy as np
 import pretty_midi
 
-from . import arrange, audio
+from . import arrange, audio, backing
+from .acestep import AceStep
 from .chords import Chart
 from .instruments import TRACKS, Track
 from .rhythm import Grid, lock_to_grid, make_grid
@@ -34,6 +38,7 @@ SILENT_STEM_RATIO = 0.04
 BASS_TOP = 52
 
 Progress = Callable[[str, float], None]
+Separate = Callable[[np.ndarray, Callable[[float], None]], dict[str, np.ndarray]]
 
 _separator = None
 
@@ -94,50 +99,169 @@ def process_song(
     source: Path,
     soundfont: Path,
     on_progress: Progress,
-    separate_fn: Callable[[np.ndarray, Callable[[float], None]], dict[str, np.ndarray]] = separate,
+    separate_fn: Separate = separate,
     chart: Chart | None = None,
+    engine: AceStep | None = None,
+    backing_settings: dict | None = None,
 ) -> dict:
-    """Builds `song_dir/tracks/<id>.m4a` (recreated) and `song_dir/original/<id>.m4a`
-    (the separated stem, for comparison). Returns the metadata the player needs."""
+    """Builds `song_dir/tracks/<id>.m4a` (the play-along tracks) and `song_dir/original/<id>.m4a`
+    (the separated stems, for comparison). Returns the metadata the player needs.
+
+    With `engine` (ACE-Step), the tracks come from a new AI band recording of the song;
+    without it, each part is transcribed and played back note by note."""
     audio.require_tools()
-    original_dir = song_dir / "original"
-    original_dir.mkdir(parents=True, exist_ok=True)
-
-    with tempfile.TemporaryDirectory(prefix="worship-tracks-") as tmp_name:
-        tmp = Path(tmp_name)
-        on_progress("Reading the song", 0.01)
-        mix_wav = tmp / "mix.wav"
-        duration = audio.decode(source, mix_wav)
-        mix = audio.read(mix_wav)
-        audio.encode_m4a(mix_wav, song_dir / "mix.m4a", duration)
-
-        on_progress("Listening for each instrument", 0.03)
-        stems = separate_fn(mix, lambda f: on_progress("Listening for each instrument", 0.03 + 0.5 * f))
-        for track in TRACKS:
-            stem_wav = tmp / f"{track.stem}.wav"
-            audio.write(stem_wav, stems[track.stem])
-            audio.encode_m4a(stem_wav, original_dir / f"{track.id}.m4a", duration)
-
+    on_progress("Reading the song", 0.01)
+    stems, mix, duration = _separate_song(song_dir, source, separate_fn,
+                                          lambda f: on_progress("Listening for each instrument", 0.02 + 0.3 * f))
     mono = {name: stem.mean(axis=0) for name, stem in stems.items()}
-    return build_tracks(song_dir, mono, mix.mean(axis=0), duration, soundfont, chart,
-                        lambda step, f: on_progress(step, 0.53 + 0.47 * f))
+    return finish_song(song_dir, mono, mix.mean(axis=0), duration, soundfont, chart, engine, backing_settings,
+                       separate_fn, lambda step, f: on_progress(step, 0.32 + 0.68 * f))
 
 
-def rebuild_tracks(song_dir: Path, soundfont: Path, chart: Chart | None, on_progress: Progress) -> dict:
-    """Make the tracks again (e.g. with a new chord chart) from the stems already saved,
-    without separating the song again."""
+def rebuild_tracks(
+    song_dir: Path,
+    soundfont: Path,
+    chart: Chart | None,
+    on_progress: Progress,
+    engine: AceStep | None = None,
+    backing_settings: dict | None = None,
+    separate_fn: Separate = separate,
+    make_tracks: bool = True,
+) -> dict:
+    """Make the tracks again (a new chord chart, a new AI band take) from the stems already
+    saved, without separating the song again. With `make_tracks` False, only the analysis
+    (layout and chords) is redone and the existing tracks are kept."""
     audio.require_tools()
+    if engine is not None and make_tracks and not (song_dir / "instrumental.flac").exists():
+        # Songs made before the AI band existed: separate once more to get a clean instrumental.
+        on_progress("Listening for each instrument", 0.02)
+        source = next(song_dir.glob("source.*"))
+        _separate_song(song_dir, source, separate_fn, lambda f: on_progress("Listening for each instrument", 0.02 + 0.3 * f))
     with tempfile.TemporaryDirectory(prefix="worship-tracks-") as tmp_name:
         tmp = Path(tmp_name)
-        on_progress("Reading the song", 0.02)
+        on_progress("Reading the song", 0.33)
         duration = audio.decode(song_dir / "mix.m4a", tmp / "mix.wav")
         mix = audio.read(tmp / "mix.wav")[0]
         stems = {}
         for track in TRACKS:
             audio.decode(song_dir / "original" / f"{track.id}.m4a", tmp / f"{track.id}.wav")
             stems[track.stem] = audio.read(tmp / f"{track.id}.wav")[0]
-    return build_tracks(song_dir, stems, mix, duration, soundfont, chart,
-                        lambda step, f: on_progress(step, 0.05 + 0.95 * f))
+    return finish_song(song_dir, stems, mix, duration, soundfont, chart, engine, backing_settings, separate_fn,
+                       lambda step, f: on_progress(step, 0.35 + 0.65 * f), make_tracks=make_tracks)
+
+
+def _separate_song(song_dir: Path, source: Path, separate_fn: Separate, on_progress: Callable[[float], None]):
+    """Separate the upload into stems; saves the mix, each stem, and the instrumental
+    (everything but vocals) the AI band plays from. Returns (stereo stems, stereo mix, seconds)."""
+    original_dir = song_dir / "original"
+    original_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="worship-tracks-") as tmp_name:
+        tmp = Path(tmp_name)
+        mix_wav = tmp / "mix.wav"
+        duration = audio.decode(source, mix_wav)
+        mix = audio.read(mix_wav)
+        audio.encode_m4a(mix_wav, song_dir / "mix.m4a", duration)
+        stems = separate_fn(mix, on_progress)
+        for track in TRACKS:
+            stem_wav = tmp / f"{track.stem}.wav"
+            audio.write(stem_wav, stems[track.stem])
+            audio.encode_m4a(stem_wav, original_dir / f"{track.id}.m4a", duration)
+        audio.write(song_dir / "instrumental.flac", backing.instrumental(stems))
+    return stems, mix, duration
+
+
+def finish_song(
+    song_dir: Path,
+    stems: dict[str, np.ndarray],
+    mix: np.ndarray,
+    duration: float,
+    soundfont: Path,
+    chart: Chart | None,
+    engine: AceStep | None,
+    backing_settings: dict | None,
+    separate_fn: Separate,
+    on_progress: Progress,
+    make_tracks: bool = True,
+) -> dict:
+    """Analyse the song's layout, then make the tracks: an AI band take when ACE-Step is
+    available, otherwise note-by-note. With `make_tracks` False, just the analysis."""
+    sr = audio.SAMPLE_RATE
+    on_progress("Finding the beat", 0.0)
+    grid = make_grid(mix, sr, duration, chart.tempo if chart else None, chart.time if chart else None)
+    spans = None
+    if chart and chart.vocabulary:
+        on_progress("Following the chord chart", 0.02)
+        harmony = stems["guitar"] + stems["piano"] + stems["other"]
+        spans = arrange.recognise_chords(harmony, stems["bass"], sr, duration, chart, grid)
+    on_progress("Working out the song's layout", 0.04)
+    layout = backing.analyse(song_dir, stems, mix, duration, grid, chart,
+                             engine if (song_dir / "instrumental.flac").exists() else None)
+    result = {
+        "duration": duration,
+        "chords": [s.to_dict() for s in spans] if spans else [],
+        "layout": layout.to_dict(),
+    }
+
+    if not make_tracks:
+        on_progress("Done", 1.0)
+        return result
+    if engine is None:
+        result.update(build_tracks(song_dir, stems, mix, duration, soundfont, chart,
+                                   lambda step, f: on_progress(step, 0.1 + 0.9 * f), grid=grid, spans=spans))
+        result["engine"] = "notes"
+        return result
+
+    settings = backing_settings or {}
+    caption = (settings.get("caption") or "").strip() or layout.instruments
+    strength = float(settings.get("strength") or 1.0)
+    started = 0.1
+
+    def waiting(seconds: float) -> None:
+        # ACE-Step doesn't report progress; assume about two minutes and creep along after.
+        on_progress(f"The AI band is playing the song ({int(seconds) // 60}:{int(seconds) % 60:02d})",
+                    started + 0.6 * min(0.95, seconds / (seconds + 120)))
+
+    generated, details = backing.generate(song_dir, engine, layout, caption, duration, strength,
+                                          settings.get("seed"), waiting)
+    result.update(_band_tracks(song_dir, generated, stems, mix, duration, separate_fn,
+                               lambda step, f: on_progress(step, 0.72 + 0.28 * f)))
+    result["engine"] = "ai-band"
+    result["backing"] = {**details, "caption": caption, "strength": strength}
+    return result
+
+
+def _band_tracks(song_dir: Path, generated: np.ndarray, stems: dict[str, np.ndarray], mix: np.ndarray,
+                 duration: float, separate_fn: Separate, on_progress: Progress) -> dict:
+    """Split the AI band's recording into the player's tracks. The vocal track is the
+    original singer, as a guide."""
+    tracks_dir = song_dir / "tracks"
+    tracks_dir.mkdir(parents=True, exist_ok=True)
+    on_progress("Splitting the band into instruments", 0.0)
+    band = separate_fn(generated, lambda f: on_progress("Splitting the band into instruments", 0.9 * f))
+    band_rms = audio.rms(generated.mean(axis=0))
+    results = []
+    with tempfile.TemporaryDirectory(prefix="worship-tracks-") as tmp_name:
+        tmp = Path(tmp_name)
+        audio.write(tmp / "backing.wav", generated)
+        audio.encode_m4a(tmp / "backing.wav", song_dir / "backing.m4a", duration)
+        for track in TRACKS:
+            if track.id == "melody":
+                present = audio.rms(stems["vocals"]) > audio.rms(mix) * SILENT_STEM_RATIO
+                if present:
+                    shutil.copyfile(song_dir / "original" / "melody.m4a", tracks_dir / "melody.m4a")
+                results.append({**_track_info(track, notes=0, present=present), "label": "Vocals (original)",
+                                "ai": False})
+                continue
+            stem = band[track.stem]
+            present = audio.rms(stem) > band_rms * SILENT_STEM_RATIO
+            if present:
+                audio.write(tmp / f"{track.id}.wav", stem)
+                audio.encode_m4a(tmp / f"{track.id}.wav", tracks_dir / f"{track.id}.m4a", duration)
+            elif (tracks_dir / f"{track.id}.m4a").exists():
+                (tracks_dir / f"{track.id}.m4a").unlink()
+            results.append(_track_info(track, notes=0, present=present))
+    on_progress("Done", 1.0)
+    return {"tracks": results}
 
 
 def build_tracks(
@@ -148,6 +272,8 @@ def build_tracks(
     soundfont: Path,
     chart: Chart | None,
     on_progress: Progress,
+    grid: Grid | None = None,
+    spans=None,
 ) -> dict:
     """Transcribe each (mono) stem and play it back. With a chart, chordal parts play
     the chart's chords instead of the notes the AI heard."""
@@ -156,13 +282,13 @@ def build_tracks(
     for d in (tracks_dir, midi_dir):
         d.mkdir(parents=True, exist_ok=True)
     sr = audio.SAMPLE_RATE
-    on_progress("Finding the beat", 0.0)
-    grid = make_grid(mix, sr, duration, chart.tempo if chart else None, chart.time if chart else None)
-    spans = None
-    if chart and chart.vocabulary:
-        on_progress("Following the chord chart", 0.03)
-        harmony = stems["guitar"] + stems["piano"] + stems["other"]
-        spans = arrange.recognise_chords(harmony, stems["bass"], sr, duration, chart, grid)
+    if grid is None:
+        on_progress("Finding the beat", 0.0)
+        grid = make_grid(mix, sr, duration, chart.tempo if chart else None, chart.time if chart else None)
+        if chart and chart.vocabulary:
+            on_progress("Following the chord chart", 0.03)
+            harmony = stems["guitar"] + stems["piano"] + stems["other"]
+            spans = arrange.recognise_chords(harmony, stems["bass"], sr, duration, chart, grid)
 
     mix_rms = audio.rms(mix)
     results = []

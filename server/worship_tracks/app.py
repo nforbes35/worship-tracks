@@ -6,6 +6,7 @@ import logging
 import os
 import secrets
 import tempfile
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .acestep import AceStep
 from .chords import Chart, parse_chart_text, read_chart
 from .library import Library
 
@@ -43,6 +45,7 @@ def create_app(
     soundfont: Path | None = None,
     passcode: str | None = None,
     start_worker: bool = True,
+    engine_factory: Callable[[], AceStep | None] | None = None,
 ) -> FastAPI:
     """Settings default to the WT_* environment variables (see scripts/config.example)."""
     if data_dir is None:
@@ -54,7 +57,17 @@ def create_app(
         passcode = os.environ.get("WT_PASSCODE", "")
     passcode = passcode.strip()
     data_dir.mkdir(parents=True, exist_ok=True)
-    library = Library(data_dir, soundfont)
+    engine_choice = os.environ.get("WT_ENGINE", "auto").strip().lower()
+
+    def running_engine() -> AceStep | None:
+        """The AI band, if it's switched on (WT_ENGINE, default auto) and running."""
+        if engine_choice in ("notes", "off", "none"):
+            return None
+        engine = AceStep()
+        return engine if engine.available() else None
+
+    engine_factory = engine_factory or running_engine
+    library = Library(data_dir, soundfont, engine_factory)
     token = _session_token(data_dir, passcode) if passcode else ""
 
     @asynccontextmanager
@@ -173,6 +186,21 @@ def create_app(
         if _song_or_404(song_id).get("chart") is None:
             raise HTTPException(404, "This song has no chord chart")
         return library.set_chart(song_id, None)
+
+    @app.get("/api/engine")
+    def engine_status():
+        return {"aiBand": engine_factory() is not None}
+
+    class NewTake(BaseModel):
+        caption: str = ""
+        strength: float = 1.0
+
+    @app.post("/api/songs/{song_id}/backing")
+    def new_take(song_id: str, body: NewTake):
+        _song_or_404(song_id)
+        if engine_factory() is None:
+            raise HTTPException(503, "The AI band isn't running on the Mac mini. See the README: AI band.")
+        return library.new_take(song_id, body.caption[:1000], min(1.0, max(0.3, body.strength)))
 
     @app.post("/api/songs/{song_id}/retry")
     def retry(song_id: str):
